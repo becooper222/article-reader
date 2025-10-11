@@ -48,7 +48,7 @@ def _extract_images_from_page(page) -> List[Tuple[bytes, str]]:
     return images
 
 
-def parse_pdf(pdf_path: str, max_pages: int = 20) -> Tuple[str, List[Tuple[bytes, str]]]:
+def parse_pdf(pdf_path: str, max_pages: int = 30) -> Tuple[str, List[Tuple[bytes, str]]]:
     if not os.path.exists(pdf_path):
         raise FileNotFoundError("PDF file not found")
 
@@ -83,8 +83,8 @@ def estimate_tokens(pdf_path: str) -> int:
     text_parts: List[str] = []
     try:
         with pdfplumber.open(pdf_path) as pdf:
-            if len(pdf.pages) > 20:
-                raise ValueError("PDF exceeds 20 page limit")
+            if len(pdf.pages) > 30:
+                raise ValueError("PDF exceeds 30 page limit")
             for page in pdf.pages:
                 try:
                     txt = page.extract_text(layout=True) or page.extract_text() or ""
@@ -127,6 +127,23 @@ def _build_gemini_prompt(citation_style: str) -> str:
         "- Avoid reading URLs, reference lists, inline reference numbers, or footnotes.\n"
         "- Keep sentences conversational and fluid for listening; use punctuation to guide natural pauses.\n"
         "- Keep total length concise but comprehensive.\n"
+    )
+
+
+def _build_gemini_cleanup_prompt(citation_style: str) -> str:
+    cite = ("omit citations entirely" if citation_style == "Ignore" else
+            "replace in-text citations with brief phrases like 'as a citation notes' without details")
+    return (
+        "You will receive raw text extracted from a research PDF. Clean it for direct text-to-speech without changing its meaning.\n"
+        "Strict requirements (follow exactly):\n"
+        "- DO NOT summarize or reorder content. Preserve the original information and section order.\n"
+        "- Output plain text only. No markdown, labels, or stage directions.\n"
+        "- Merge broken lines and hyphenations across line breaks; form natural sentences and paragraphs.\n"
+        "- Remove page headers/footers, page numbers, and repeated boilerplate.\n"
+        "- Omit reference lists, footnotes, and URLs.\n"
+        f"- For citations, {cite}.\n"
+        "- Expand symbols and formulas into spoken-friendly text when necessary, without altering intent.\n"
+        "- Keep the final text conversational and ready for voice synthesis.\n"
     )
 
 
@@ -312,6 +329,47 @@ def structure_with_gemini(text: str,
         raise RuntimeError(f"Gemini error: {e}")
 
 
+def clean_with_gemini(text: str,
+                      api_key: str,
+                      model_name: str,
+                      citation_style: str,
+                      cancel_event,
+                      log: Callable[[str], None]) -> str:
+    if not api_key:
+        raise ValueError("Gemini API key is missing. Please set it in Settings.")
+    if cancel_event.is_set():
+        raise InterruptedError("Cancelled")
+
+    genai.configure(api_key=api_key)
+    prompt = _build_gemini_cleanup_prompt(citation_style)
+
+    contents: List = [
+        {"role": "user", "parts": [
+            {"text": prompt},
+            {"text": text[:200000]}
+        ]}
+    ]
+
+    model = genai.GenerativeModel(model_name=model_name)
+    log("Cleaning text with Gemini...")
+    if cancel_event.is_set():
+        raise InterruptedError("Cancelled")
+
+    try:
+        resp = model.generate_content(contents)
+        cleaned = getattr(resp, "text", None)
+        if not cleaned:
+            try:
+                cleaned = resp.candidates[0].content.parts[0].text  # type: ignore[attr-defined]
+            except Exception:
+                cleaned = ""
+        if not cleaned:
+            raise RuntimeError("No content returned from Gemini")
+        return cleaned.strip()
+    except Exception as e:
+        raise RuntimeError(f"Gemini error: {e}")
+
+
 def synthesize_with_elevenlabs(text: str,
                                api_key: str,
                                voice_id: str,
@@ -376,6 +434,7 @@ class ConversionWorker:
     @staticmethod
     def run(pdf_path: str,
             citation_style: str,
+            conversion_mode: str,
             config_mgr,
             cancel_event,
             done_callback: Callable[[str, Optional[str]], None]) -> None:
@@ -396,15 +455,25 @@ class ConversionWorker:
             api_key = cfg.get("gemini_api_key", "")
             model_name = cfg.get("model_name", "gemini-2.5-pro")
 
-            script = structure_with_gemini(
-                text=text,
-                images=images,
-                api_key=api_key,
-                model_name=model_name,
-                citation_style=citation_style,
-                cancel_event=cancel_event,
-                log=lambda m: send("status", m),
-            )
+            if (conversion_mode or 'Summarized') == 'Verbatim':
+                script = clean_with_gemini(
+                    text=text,
+                    api_key=api_key,
+                    model_name=model_name,
+                    citation_style=citation_style,
+                    cancel_event=cancel_event,
+                    log=lambda m: send("status", m),
+                )
+            else:
+                script = structure_with_gemini(
+                    text=text,
+                    images=images,
+                    api_key=api_key,
+                    model_name=model_name,
+                    citation_style=citation_style,
+                    cancel_event=cancel_event,
+                    log=lambda m: send("status", m),
+                )
             if cancel_event.is_set():
                 send("cancelled")
                 return

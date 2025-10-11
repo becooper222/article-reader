@@ -19,7 +19,12 @@ class ConfigManager:
             "stability": 0.5,
             "clarity": 0.5,  # mapped to ElevenLabs similarity_boost
             "citation_style": "Ignore",
+            # Conversion mode: 'Summarized' (Gemini-structured) or 'Verbatim' (raw text)
+            "conversion_mode": "Summarized",
             "usd_per_million_tokens": 5.0,
+            # Audio cost estimates (per million characters)
+            "usd_per_million_chars_google_tts": 16.0,
+            "usd_per_million_chars_elevenlabs": 15.0,
             # Audio provider selection: 'google_tts' (default) or 'elevenlabs'
             "audio_provider": "google_tts",
             # Google TTS (Studio) settings
@@ -67,6 +72,25 @@ class ConfigManager:
         except Exception:
             rate = 5.0
         return (tokens / 1_000_000.0) * rate
+
+    def estimate_tts_cost(self, provider: str, num_chars: int) -> float:
+        """Estimate text-to-speech cost based on configured per-million-char rates.
+
+        This is an approximation; real billing may vary by provider, voice, or region.
+        """
+        try:
+            data = self.load()
+        except Exception:
+            data = self.default_config()
+
+        prov = (provider or "google_tts").strip().lower()
+        if prov == "elevenlabs":
+            rate = float(data.get("usd_per_million_chars_elevenlabs", 15.0))
+        else:
+            # Default to Google TTS Studio
+            rate = float(data.get("usd_per_million_chars_google_tts", 16.0))
+
+        return (max(0, int(num_chars)) / 1_000_000.0) * rate
 
     def fetch_elevenlabs_voices(self, api_key: str) -> List[Dict[str, Any]]:
         if not api_key:

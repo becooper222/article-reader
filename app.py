@@ -29,6 +29,7 @@ class App:
 
         self.selected_pdf = StringVar(value="")
         self.citation_style = StringVar(value=self.config_data.get('citation_style', 'Ignore'))
+        self.conversion_mode = StringVar(value=self.config_data.get('conversion_mode', 'Summarized'))
         self.status_text = StringVar(value="Ready")
         self.is_processing = BooleanVar(value=False)
 
@@ -69,11 +70,21 @@ class App:
         select_btn = ttk.Button(top, text="Select PDF", command=self.select_pdf)
         select_btn.pack(side='left')
 
-        ttk.Label(top, textvariable=self.selected_pdf, width=80).pack(side='left', padx=10)
+        # Expandable, read-only path display to avoid pushing buttons off-screen
+        path_entry = ttk.Entry(top, textvariable=self.selected_pdf, state='readonly')
+        path_entry.pack(side='left', padx=10, fill='x', expand=True)
 
         ttk.Label(top, text="Citation Style:").pack(side='left', padx=(20,5))
         citation_combo = ttk.Combobox(top, textvariable=self.citation_style, values=["Ignore","Subtle Mention"], state='readonly', width=18)
         citation_combo.pack(side='left')
+
+        ttk.Label(top, text="Mode:").pack(side='left', padx=(20,5))
+        mode_combo = ttk.Combobox(top, textvariable=self.conversion_mode, values=["Summarized","Verbatim"], state='readonly', width=14)
+        mode_combo.pack(side='left')
+
+        # Settings button within the main UI
+        settings_btn = ttk.Button(top, text="Settings", command=self.open_settings)
+        settings_btn.pack(side='right', padx=(0,10))
 
         convert_btn = ttk.Button(top, text="Convert", command=self.on_convert)
         convert_btn.pack(side='right')
@@ -99,7 +110,8 @@ class App:
 
         # Generate Audio button
         action_bar = ttk.Frame(container)
-        action_bar.pack(fill='x', pady=(10,0))
+        # Pin action bar to bottom so its buttons remain visible on small windows
+        action_bar.pack(side='bottom', fill='x', pady=(10,0))
         load_btn = ttk.Button(action_bar, text="Load Script", command=self.load_script_from_file)
         load_btn.pack(side='left')
         gen_btn = ttk.Button(action_bar, text="Generate Audio", command=self.on_generate_audio)
@@ -124,6 +136,7 @@ class App:
     def _on_settings_saved(self, data):
         self.config_data = data
         self.citation_style.set(self.config_data.get('citation_style', 'Ignore'))
+        self.conversion_mode.set(self.config_data.get('conversion_mode', 'Summarized'))
 
     def on_convert(self):
         if self.is_processing.get():
@@ -134,7 +147,7 @@ class App:
             messagebox.showwarning("No File", "Please select a PDF file first.")
             return
         try:
-            # Cost estimation
+            # Always estimate Gemini cost since Verbatim is cleaned with LLM now
             est_tokens = estimate_tokens(pdf_path)
             est_cost = self.config_mgr.estimate_gemini_cost(est_tokens)
             proceed = messagebox.askyesno("Confirm Cost", f"Estimated {est_tokens} tokens (~${est_cost:.4f}). Proceed?")
@@ -153,7 +166,7 @@ class App:
 
         self.worker_thread = threading.Thread(
             target=ConversionWorker.run,
-            args=(pdf_path, self.citation_style.get(), self.config_mgr, self.cancel_event, done_callback),
+            args=(pdf_path, self.citation_style.get(), self.conversion_mode.get(), self.config_mgr, self.cancel_event, done_callback),
             daemon=True,
         )
         self.worker_thread.start()
@@ -169,6 +182,21 @@ class App:
         if not text.strip():
             messagebox.showwarning("No Script", "No script to synthesize. Run Convert first.")
             return
+        # Estimate audio cost and confirm
+        try:
+            cfg = self.config_mgr.load()
+            provider = (cfg.get('audio_provider') or 'google_tts').strip().lower()
+            num_chars = len(" ".join(text.split()))
+            est_cost = self.config_mgr.estimate_tts_cost(provider, num_chars)
+            proceed = messagebox.askyesno(
+                "Confirm Audio Cost",
+                f"Audio provider: {provider}\nCharacters: {num_chars}\nEstimated cost: ${est_cost:.4f}. Proceed?"
+            )
+            if not proceed:
+                return
+        except Exception as e:
+            messagebox.showerror("Estimation Error", str(e))
+            return
         try:
             audio_bytes = ConversionWorker.generate_audio_only(text, self.config_mgr, self.cancel_event, self.log)
             if audio_bytes is None:
@@ -183,6 +211,11 @@ class App:
             try:
                 with open(save_path, 'wb') as f:
                     f.write(audio_bytes)
+                # Also save the exact text used for synthesis next to the MP3
+                base, _ = os.path.splitext(save_path)
+                text_path = base + '.txt'
+                with open(text_path, 'w', encoding='utf-8') as tf:
+                    tf.write(text)
                 messagebox.showinfo("Success", "Audio saved successfully.")
             except Exception as e:
                 messagebox.showerror("Save Error", str(e))
