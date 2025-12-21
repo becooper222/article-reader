@@ -172,3 +172,16 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# Project-specific
+config.json
+.env.local
+.env
+.batch_state.json
+.batch_lock
+.pricing_cache.json
+batch.log
+*.mp3
+*.txt.gz
+audio_papers/
+voice_samples/
