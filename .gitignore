@@ -185,3 +185,4 @@ batch.log
 *.txt.gz
 audio_papers/
 voice_samples/
+*.app/
