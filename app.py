@@ -1140,11 +1140,21 @@ class SettingsWindow(ctk.CTkToplevel):
         
         # Status indicator for Gemini
         existing_gemini_key = data.get('gemini_api_key', '')
+        env_gemini_key = os.environ.get("GEMINI_API_KEY", "")
+        if existing_gemini_key:
+            if env_gemini_key and existing_gemini_key == env_gemini_key:
+                gemini_status = "✓ From .env.local"
+            else:
+                gemini_status = "✓ Configured"
+            gemini_color = ("#22c55e", "#4ade80")
+        else:
+            gemini_status = "✗ Required"
+            gemini_color = ("#ef4444", "#f87171")
         self.gemini_status_label = ctk.CTkLabel(
             gemini_key_header,
-            text="✓ Configured" if existing_gemini_key else "✗ Required",
+            text=gemini_status,
             font=ctk.CTkFont(size=11),
-            text_color=("#22c55e", "#4ade80") if existing_gemini_key else ("#ef4444", "#f87171"),
+            text_color=gemini_color,
         )
         self.gemini_status_label.pack(side="left", padx=10)
         
@@ -1157,7 +1167,7 @@ class SettingsWindow(ctk.CTkToplevel):
         
         self.api_key_entry = ctk.CTkEntry(
             gemini_key_frame,
-            placeholder_text="Enter your Gemini API key",
+            placeholder_text="Enter Gemini API key (or set GEMINI_API_KEY in .env.local)",
             show="•",
         )
         self.api_key_entry.pack(fill="x", pady=(5, 0))

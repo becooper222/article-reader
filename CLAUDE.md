@@ -79,6 +79,6 @@ Inworld AI is default. On quota exceeded (HTTP 429) or auth failures, automatica
 - `.pricing_cache.json` - Cached model pricing
 
 ## API Keys Required
-- **Gemini API Key**: Required for text processing (set in Settings or config.json)
-- **Inworld API Key**: For Inworld TTS (base64-encoded, in `.env.local` or config)
+- **Gemini API Key**: Required for text processing and TTS fallback (`GEMINI_API_KEY` in `.env.local`, or set in Settings)
+- **Inworld API Key**: For Inworld TTS (base64-encoded, `INWORLD_API_KEY` in `.env.local`, or set in Settings)
 - **Gemini TTS**: Uses same Gemini API key (select "gemini" as TTS provider)

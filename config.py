@@ -308,8 +308,6 @@ class PricingCache:
             return 0.30  # Inworld models
         elif "gemini" in model_lower:
             return 0.80  # Gemini TTS
-        elif "elevenlabs" in model_lower:
-            return 1.50  # ElevenLabs (premium)
         else:
             return 0.50  # Default estimate
     
@@ -372,7 +370,7 @@ class ConfigManager:
 
     def default_config(self) -> Dict[str, Any]:
         return {
-            "gemini_api_key": "",
+            "gemini_api_key": os.environ.get("GEMINI_API_KEY", ""),
             # Gemini model for text processing (summarization/cleaning)
             "model_name": "gemini-2.0-flash",
             
@@ -410,14 +408,11 @@ class ConfigManager:
         for k, v in defaults.items():
             data.setdefault(k, v)
         
-        # Inworld API key: use config.json if set, otherwise fall back to env
-        # This allows UI to override env variable
-        config_inworld_key = data.get("inworld_api_key", "")
-        env_inworld_key = os.environ.get("INWORLD_API_KEY", "")
-        
-        if not config_inworld_key and env_inworld_key:
-            # Config is empty, use env as fallback
-            data["inworld_api_key"] = env_inworld_key
+        # API keys: use config.json if set, otherwise fall back to env
+        # This allows UI to override env variables
+        for key, env_var in [("gemini_api_key", "GEMINI_API_KEY"), ("inworld_api_key", "INWORLD_API_KEY")]:
+            if not data.get(key, "") and os.environ.get(env_var, ""):
+                data[key] = os.environ[env_var]
         
         return data
 

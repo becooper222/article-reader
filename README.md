@@ -4,17 +4,17 @@ A desktop app that turns research PDFs into a clean, single-voice narration you 
 
 ### Features
 - Convert PDFs (default limit: 20 pages, configurable in Settings) into a natural narration script
-- Pre‑flight editor to review and tweak the script
-- Text‑to‑speech to MP3
-- Audio providers: Google TTS (Studio) or ElevenLabs (default selection is Google TTS in code)
+- Pre-flight editor to review and tweak the script
+- Text-to-speech to MP3
+- Audio providers: Inworld AI (default) with Gemini TTS as fallback
 - Conversion modes: Summarized (Gemini-structured) or Verbatim (Gemini-cleaned raw text)
 
 ## Prerequisites
 - Python 3.10+ recommended
 - macOS, Windows, or Linux with Tk (Tkinter) available
 - Internet access and API keys:
-  - Gemini API key (for structuring the script)
-  - Google TTS API key (Studio REST) and/or ElevenLabs API key
+  - Gemini API key (for text processing and TTS fallback)
+  - Inworld API key (for primary TTS)
 
 ## Setup
 1) Clone and enter the project directory
@@ -43,30 +43,29 @@ If Tk fails to start due to missing Tkinter, install a Python build with Tk supp
 
 ## Configure API keys
 
-### 1. Gemini API Key (required)
-The Gemini API is used for text processing (summarization/cleaning). Set it in the app's Settings.
-
-### 2. TTS Provider (choose one)
-
-**Inworld AI (default):**
-Create a `.env.local` file in the project directory:
+Create a `.env.local` file in the project directory with your keys:
 ```bash
-INWORLD_API_KEY=your_base64_encoded_key_here
+GEMINI_API_KEY='your_gemini_api_key_here'
+INWORLD_API_KEY='your_base64_encoded_inworld_key_here'
 ```
 
-Available voices: Ashley, Brian, Cora, David, Emma, George, Hailey, Isaac, Julia, Kevin
+### Gemini API Key (required)
+Used for text processing (summarization/cleaning) and as a TTS fallback. Get a key from [Google AI Studio](https://aistudio.google.com/apikey).
 
-**Gemini TTS:**
+### Inworld API Key (required for Inworld TTS)
+Used for the default TTS provider. The key should be base64-encoded. Get a key from [Inworld AI](https://www.inworld.ai/).
+
+Available Inworld voices: Ashley, Brian, Cora, David, Emma, George, Hailey, Isaac, Julia, Kevin
+
+### Gemini TTS (alternative, no extra key needed)
 Uses the same Gemini API key. Select "gemini" as the TTS provider in Settings.
 
-### In-app Settings
-Open `Settings` (menu bar → Settings) to configure:
-- Gemini API Key
-- TTS Provider (Inworld or Gemini)
-- Voice selection for each provider
-- Default citation style and conversion mode
+### Where keys are stored
+Keys can be set in two places (in order of priority):
+1. **Settings UI** — saved to `config.json` (auto-created, do not commit)
+2. **`.env.local`** — environment variables, used as fallback if Settings are empty
 
-Note: A `config.json` file is automatically created to store your settings locally. Do not commit this file. To reset settings, close the app and delete `config.json`.
+Both files are in `.gitignore`. To reset settings, close the app and delete `config.json`.
 
 ## Usage
 1) File → Select PDF, choose a paper (page limit configurable in Settings, default: 20)
@@ -80,12 +79,12 @@ Note: A `config.json` file is automatically created to store your settings local
 
 ### Limits and notes
 - PDF limit: 20 pages by default (configurable in Settings → Conversion Defaults → Max PDF Pages)
-- Google TTS Studio uses short input chunks; the app automatically splits the script into byte‑safe parts and concatenates the MP3
-- Costs: You are responsible for any API usage fees for Gemini, Google TTS, or ElevenLabs
+- Inworld TTS automatically falls back to Gemini TTS on quota exceeded (HTTP 429) or auth failures
+- Costs: You are responsible for any API usage fees for Gemini and Inworld
 
 ### Cost estimation
 - Before Convert in Summarized mode: shows an estimated Gemini cost based on tokens.
-- Before Generate Audio: shows an estimated audio cost based on characters and your selected provider. Rates are configurable via `usd_per_million_chars_google_tts` and `usd_per_million_chars_elevenlabs` in `config.json` (defaults are approximations).
+- Before Generate Audio: shows an estimated audio cost based on characters and your selected provider.
 
 ## Command-line usage
 You can run the full two-step conversion (Gemini → TTS) without opening the GUI. The CLI prints estimated costs for both steps and shows progress with tqdm progress bars.
@@ -150,15 +149,15 @@ Example output:
 BATCH JOB: 20250620_143022
 ==================================================
 
-Status: 🟢 RUNNING
+Status: RUNNING
 PID: 12345
 
 Progress: 5/20 completed
 [████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░] 25.0%
 
-  ✅ Completed: 5
-  ❌ Failed:    0
-  ⏳ Pending:   15
+  Completed: 5
+  Failed:    0
+  Pending:   15
 ```
 
 ### Resume interrupted job
@@ -187,26 +186,18 @@ The batch processor creates these files in the project directory:
 
 ## Troubleshooting
 - Missing API Key errors: Ensure keys are set in Settings and saved
-- Google TTS: If you see errors like "No audioContent in response" or quota/permission errors, verify the Studio API key, project billing, and TTS API enablement
-- ElevenLabs: Voice fetch failures usually indicate an invalid key or network issues
-- PDF parse errors: Ensure the PDF is readable; very image‑heavy or scanned PDFs may extract little text
-
-## Optional: Verify TTS with the included tests
-Run these small scripts to sanity‑check your keys (they will make billable API calls):
-```bash
-python test_google_studio_tts.py   # requires Google TTS API key
-python test_elevenlabs.py          # requires ElevenLabs API key
-```
+- Inworld TTS: If you see quota or rate limit errors, the app will automatically fall back to Gemini TTS
+- PDF parse errors: Ensure the PDF is readable; very image-heavy or scanned PDFs may extract little text
 
 ## Security
 - Keys are stored locally in `config.json`. Keep this file private and out of version control.
 - Avoid sharing logs that include request details or keys.
 
 ## Disclaimer
-- You supply and control your own API keys. You are solely responsible for how this tool is used, for any content you process or generate with it, for complying with the terms/policies of the API providers (e.g., Gemini, Google TTS Studio, ElevenLabs), and for any associated fees or charges.
-- The author/maintainers do not control, monitor, or assume responsibility for your usage. No warranty is provided; use at your own risk. The author/maintainers are not liable for misuse, violations of third‑party policies, or costs incurred.
+- You supply and control your own API keys. You are solely responsible for how this tool is used, for any content you process or generate with it, for complying with the terms/policies of the API providers (e.g., Gemini, Inworld AI), and for any associated fees or charges.
+- The author/maintainers do not control, monitor, or assume responsibility for your usage. No warranty is provided; use at your own risk. The author/maintainers are not liable for misuse, violations of third-party policies, or costs incurred.
 
-## Non‑Commercial Use
+## Non-Commercial Use
 - This project is intended for personal and educational use only and is not intended for commercial use.
 - Do not use the outputs to create, distribute, or monetize content in a commercial context.
 - You are responsible for ensuring you have the necessary rights to any source material you process. The author/maintainers are not responsible for copyright violations or related disputes arising from your use of this tool.
