@@ -1392,34 +1392,35 @@ def synthesize_with_inworld_tts_streaming(text: str,
         "Content-Type": "application/json"
     }
     
-    # Temporary directory for chunk files
+    # Temp dir holds one MP3 per Inworld response so the final ffmpeg pass can
+    # rebuild a single Info/Xing header. Concatenating raw MP3 streams (the old
+    # behavior) leaves the first chunk's Info header in place, and iOS uses it
+    # as the whole-file duration — which is why scrubbing froze around 2 min.
     temp_dir = tempfile.mkdtemp(prefix="inworld_tts_chunks_")
-    chunk_files: List[str] = []
-    audio_buffer: List[bytes] = []
-    buffer_size = 0
-    
+    response_files: List[str] = []
+
     try:
         with ProgressTracker(total_chunks, "Generating audio",
                             callback=progress_callback) as progress:
-            
+
             for idx, chunk in enumerate(chunks, start=1):
                 if cancel_event.is_set():
                     return None
-                
+
                 # Final safety check
                 if len(chunk) > INWORLD_CHAR_LIMIT:
                     log(f"Error: Chunk {idx} still exceeds limit ({len(chunk)} chars), truncating...")
                     chunk = chunk[:INWORLD_CHAR_LIMIT - 10] + "..."
-                
+
                 progress.set_description(f"Audio chunk {idx}/{total_chunks}")
                 log(f"Generating audio chunk {idx}/{total_chunks} ({len(chunk)} chars) with Inworld TTS ({voice_id})...")
-                
+
                 payload = {
                     "text": chunk,
                     "voiceId": voice_id,
                     "modelId": model_id
                 }
-                
+
                 try:
                     response = requests.post(
                         INWORLD_TTS_API_URL,
@@ -1427,21 +1428,17 @@ def synthesize_with_inworld_tts_streaming(text: str,
                         headers=headers,
                         timeout=120
                     )
-                    
-                    # Check for quota/rate limit errors
+
                     _check_inworld_error(response, chunk_idx=idx)
-                    
+
                     result = response.json()
-                    
+
                     if 'audioContent' not in result:
                         raise RuntimeError(f"No audioContent in response")
-                    
+
                     audio_content = base64.b64decode(result['audioContent'])
-                    audio_buffer.append(audio_content)
-                    buffer_size += len(audio_content)
-                    
+
                 except (InworldQuotaExceededError, InworldAPIError):
-                    # Re-raise these for fallback handling
                     raise
                 except requests.exceptions.Timeout:
                     raise InworldAPIError(
@@ -1455,76 +1452,59 @@ def synthesize_with_inworld_tts_streaming(text: str,
                     )
                 except Exception as e:
                     raise RuntimeError(f"Inworld TTS error on chunk {idx}/{total_chunks}: {e}")
-                
-                # Check memory pressure and flush to disk if needed
-                if buffer_size > memory_threshold_mb * 1024 * 1024 or check_memory_pressure(memory_threshold_mb):
-                    log(f"Flushing {buffer_size / (1024*1024):.1f} MB audio buffer to disk...")
-                    
-                    chunk_mp3 = os.path.join(temp_dir, f"chunk_{len(chunk_files):04d}.mp3")
-                    with open(chunk_mp3, 'wb') as f:
-                        for audio in audio_buffer:
-                            f.write(audio)
-                    
-                    chunk_files.append(chunk_mp3)
-                    audio_buffer.clear()
-                    buffer_size = 0
-                    force_gc()
-                
+
+                resp_path = os.path.join(temp_dir, f"resp_{idx:05d}.mp3")
+                with open(resp_path, 'wb') as f:
+                    f.write(audio_content)
+                response_files.append(resp_path)
+                del audio_content
+
                 progress.update(1, f"Chunk {idx}/{total_chunks}")
-        
-        # Handle remaining buffer
-        if audio_buffer:
-            if chunk_files:
-                # We already flushed some chunks, so write remaining to disk too
-                chunk_mp3 = os.path.join(temp_dir, f"chunk_{len(chunk_files):04d}.mp3")
-                with open(chunk_mp3, 'wb') as f:
-                    for audio in audio_buffer:
-                        f.write(audio)
-                chunk_files.append(chunk_mp3)
-                audio_buffer.clear()
-        
-        # Combine audio files
+
         log("Combining audio chunks...")
-        
-        if chunk_files:
-            # Use ffmpeg to concatenate MP3 files
-            concat_list = os.path.join(temp_dir, "concat.txt")
-            with open(concat_list, 'w') as f:
-                for cf in chunk_files:
-                    f.write(f"file '{cf}'\n")
-            
-            result = subprocess.run(
-                [
-                    'ffmpeg', '-y',
-                    '-f', 'concat',
-                    '-safe', '0',
-                    '-i', concat_list,
-                    '-acodec', 'copy',  # Just copy, no re-encoding
-                    output_path
-                ],
-                capture_output=True,
-                text=True
-            )
-            
-            if result.returncode != 0:
-                raise RuntimeError(f"ffmpeg concat error: {result.stderr}")
-        else:
-            # All audio is still in buffer, write directly
-            with open(output_path, 'wb') as f:
-                for audio in audio_buffer:
-                    f.write(audio)
-        
+
+        if not response_files:
+            raise RuntimeError("Inworld TTS produced no audio chunks.")
+
+        concat_list = os.path.join(temp_dir, "concat.txt")
+        with open(concat_list, 'w') as f:
+            for cf in response_files:
+                # ffmpeg concat-demuxer requires single quotes escaped as '\''
+                escaped = cf.replace("'", "'\\''")
+                f.write(f"file '{escaped}'\n")
+
+        # Re-encode (rather than -acodec copy) so the MP3 muxer writes a single
+        # Xing/Info header covering the whole stream. Inworld returns 48kHz mono
+        # 128kbps CBR; matching those params keeps the transcode imperceptible.
+        result = subprocess.run(
+            [
+                'ffmpeg', '-y',
+                '-f', 'concat',
+                '-safe', '0',
+                '-i', concat_list,
+                '-c:a', 'libmp3lame',
+                '-b:a', '128k',
+                '-ar', '48000',
+                '-ac', '1',
+                '-id3v2_version', '3',
+                output_path
+            ],
+            capture_output=True,
+            text=True
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(f"ffmpeg concat/encode error: {result.stderr}")
+
         return os.path.getsize(output_path)
-        
+
     finally:
-        # Clean up temp directory
         import shutil
         try:
             shutil.rmtree(temp_dir)
         except Exception:
             pass
-        
-        audio_buffer.clear()
+
         force_gc()
 
 
