@@ -1,19 +1,33 @@
 #!/usr/bin/env python3
 """
 Web interface for Research Paper Audiobook Converter.
-Mobile-friendly Flask app for converting PDFs to MP3 audiobooks.
+Multi-user Flask app with Google OAuth, per-user SQLite config, and SSE-based progress.
 """
 import json
 import os
 import queue
+import sqlite3
 import tempfile
 import threading
 import time
 import uuid
+from contextlib import contextmanager
+from functools import wraps
 from pathlib import Path
 
 import requests as http_requests
-from flask import Flask, Response, jsonify, render_template_string, request, send_file
+from authlib.integrations.flask_client import OAuth
+from flask import (
+    Flask,
+    Response,
+    jsonify,
+    redirect,
+    render_template_string,
+    request,
+    send_file,
+    session,
+    url_for,
+)
 
 from config import ConfigManager
 from processing import (
@@ -24,19 +38,162 @@ from processing import (
     structure_with_gemini,
 )
 
-app = Flask(__name__)
+# ---------------------------------------------------------------------------
+# App & configuration
+# ---------------------------------------------------------------------------
 
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY", "dev-secret-change-in-production")
+
 OUTPUTS_DIR = os.path.join(tempfile.gettempdir(), "article_reader_outputs")
 os.makedirs(OUTPUTS_DIR, exist_ok=True)
+
+DATABASE_PATH = os.environ.get("DATABASE_PATH", "./users.db")
+
+# ---------------------------------------------------------------------------
+# Database helpers
+# ---------------------------------------------------------------------------
+
+def _get_db_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(DATABASE_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+@contextmanager
+def get_db():
+    conn = _get_db_conn()
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def init_db():
+    with get_db() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                google_id TEXT PRIMARY KEY,
+                email TEXT UNIQUE NOT NULL,
+                name TEXT,
+                picture TEXT,
+                gemini_api_key TEXT DEFAULT '',
+                inworld_api_key TEXT DEFAULT '',
+                tts_provider TEXT DEFAULT 'inworld',
+                tts_voice_name TEXT DEFAULT 'Kore',
+                inworld_voice_id TEXT DEFAULT 'Ashley',
+                model_name TEXT DEFAULT 'gemini-2.0-flash',
+                conversion_mode TEXT DEFAULT 'Summarized',
+                citation_style TEXT DEFAULT 'Ignore',
+                created_at TEXT DEFAULT (datetime('now')),
+                last_login TEXT DEFAULT (datetime('now'))
+            )
+        """)
+
+
+init_db()
+
+
+def upsert_user(google_id: str, email: str, name: str, picture: str) -> None:
+    with get_db() as conn:
+        conn.execute("""
+            INSERT INTO users (google_id, email, name, picture, last_login)
+            VALUES (?, ?, ?, ?, datetime('now'))
+            ON CONFLICT(google_id) DO UPDATE SET
+                email = excluded.email,
+                name = excluded.name,
+                picture = excluded.picture,
+                last_login = datetime('now')
+        """, (google_id, email, name, picture))
+
+
+def get_user(google_id: str) -> dict | None:
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM users WHERE google_id = ?", (google_id,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def update_user_settings(google_id: str, updates: dict) -> None:
+    allowed = {
+        "gemini_api_key", "inworld_api_key", "model_name",
+        "tts_provider", "tts_voice_name", "inworld_voice_id",
+        "conversion_mode", "citation_style",
+    }
+    filtered = {k: v for k, v in updates.items() if k in allowed}
+    if not filtered:
+        return
+    set_clause = ", ".join(f"{k} = ?" for k in filtered)
+    values = list(filtered.values()) + [google_id]
+    with get_db() as conn:
+        conn.execute(
+            f"UPDATE users SET {set_clause} WHERE google_id = ?", values
+        )
+
+
+# ---------------------------------------------------------------------------
+# OAuth setup
+# ---------------------------------------------------------------------------
+
+oauth = OAuth(app)
+google = oauth.register(
+    name="google",
+    client_id=os.environ.get("GOOGLE_CLIENT_ID", ""),
+    client_secret=os.environ.get("GOOGLE_CLIENT_SECRET", ""),
+    server_metadata_url="https://accounts.google.com/.well-known/openid-configuration",
+    client_kwargs={"scope": "openid email profile"},
+)
+
+
+# ---------------------------------------------------------------------------
+# Auth helpers & decorator
+# ---------------------------------------------------------------------------
+
+def require_login(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if "user_id" not in session:
+            return render_template_string(LOGIN_HTML)
+        return f(*args, **kwargs)
+    return decorated
+
+
+# ---------------------------------------------------------------------------
+# UserConfigAdapter — thin wrapper so ConversionWorker can call .load()
+# ---------------------------------------------------------------------------
+
+class UserConfigAdapter:
+    """Adapts a per-user config dict to the interface expected by ConversionWorker."""
+
+    def __init__(self, user_config: dict):
+        self._cfg = dict(user_config)
+        # Supply defaults that ConversionWorker expects but may not be in DB row
+        self._cfg.setdefault("tts_fallback_enabled", True)
+        self._cfg.setdefault("inworld_model_id", "inworld-tts-1")
+        self._cfg.setdefault("tts_model_name", "gemini-2.5-flash-preview-tts")
+        self._cfg.setdefault("tts_style_prompt", "")
+
+    def load(self) -> dict:
+        return dict(self._cfg)
+
+    def ensure_config(self) -> None:
+        pass  # No-op; config lives in DB
+
+
+# ---------------------------------------------------------------------------
+# Job management
+# ---------------------------------------------------------------------------
 
 _jobs: dict = {}
 _jobs_lock = threading.Lock()
 
 
 class Job:
-    def __init__(self, filename: str):
+    def __init__(self, filename: str, user_id: str):
         self.id = str(uuid.uuid4())
+        self.user_id = user_id
         self.events: queue.Queue = queue.Queue()
         self.output_path: str | None = None
         self.filename = filename
@@ -58,16 +215,20 @@ class Job:
         self.emit("error", error)
 
 
-def run_conversion(job: Job, pdf_path: str, mode: str, citations: str, cleanup_pdf: bool):
+# ---------------------------------------------------------------------------
+# Conversion pipeline
+# ---------------------------------------------------------------------------
+
+def run_conversion(job: Job, pdf_path: str, mode: str, citations: str,
+                   cleanup_pdf: bool, user_config: dict):
     """Run the full conversion pipeline in a background thread."""
     try:
-        cfg_mgr = ConfigManager(CONFIG_PATH)
-        cfg_mgr.ensure_config()
-        cfg = cfg_mgr.load()
+        cfg_adapter = UserConfigAdapter(user_config)
+        cfg = cfg_adapter.load()
 
         api_key = cfg.get("gemini_api_key", "")
         if not api_key:
-            job.fail("Gemini API key not configured. Please visit /settings to add it.")
+            job.fail("Gemini API key not configured. Please visit Settings to add it.")
             return
 
         model_name = cfg.get("model_name", "gemini-2.0-flash")
@@ -139,7 +300,7 @@ def run_conversion(job: Job, pdf_path: str, mode: str, citations: str, cleanup_p
             file_size = ConversionWorker.generate_audio_streaming(
                 script,
                 output_path,
-                cfg_mgr,
+                cfg_adapter,
                 job.cancel_event,
                 log=log,
                 progress_callback=progress_cb,
@@ -153,7 +314,7 @@ def run_conversion(job: Job, pdf_path: str, mode: str, citations: str, cleanup_p
             job.emit("cancelled", "Cancelled by user")
             return
 
-        job.emit("status", f"Done! Audio file: {file_size / (1024*1024):.1f} MB")
+        job.emit("status", f"Done! Audio file: {file_size / (1024 * 1024):.1f} MB")
         job.finish(output_path)
 
     finally:
@@ -165,13 +326,11 @@ def run_conversion(job: Job, pdf_path: str, mode: str, citations: str, cleanup_p
         PDFCache.clear()
 
 
-MAIN_HTML = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Article to Audio</title>
-<style>
+# ---------------------------------------------------------------------------
+# HTML templates
+# ---------------------------------------------------------------------------
+
+_CSS_VARS = """
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
   :root {
     --bg: #0f1117;
@@ -190,8 +349,102 @@ MAIN_HTML = """<!DOCTYPE html>
     color: var(--text);
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     min-height: 100vh;
-    padding: 0;
   }
+"""
+
+LOGIN_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Article to Audio — Sign In</title>
+<style>
+""" + _CSS_VARS + """
+  body { display: flex; align-items: center; justify-content: center; padding: 24px; }
+  .login-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 40px 32px;
+    max-width: 420px;
+    width: 100%;
+    text-align: center;
+  }
+  .app-icon {
+    width: 64px; height: 64px;
+    background: var(--accent);
+    border-radius: 16px;
+    display: flex; align-items: center; justify-content: center;
+    margin: 0 auto 20px;
+  }
+  .app-icon svg { color: #fff; }
+  .app-name { font-size: 24px; font-weight: 700; letter-spacing: -0.4px; margin-bottom: 8px; }
+  .app-tagline { font-size: 15px; color: var(--muted); margin-bottom: 8px; }
+  .app-description {
+    font-size: 13px;
+    color: var(--muted);
+    line-height: 1.6;
+    margin-bottom: 32px;
+    padding: 0 8px;
+  }
+  .google-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 12px;
+    background: #fff;
+    color: #3c4043;
+    font-size: 15px;
+    font-weight: 500;
+    padding: 11px 22px;
+    border-radius: 8px;
+    text-decoration: none;
+    border: 1px solid #dadce0;
+    transition: box-shadow .2s, background .2s;
+    font-family: inherit;
+    cursor: pointer;
+  }
+  .google-btn:hover { box-shadow: 0 1px 6px rgba(0,0,0,.3); background: #f8f9fa; }
+  .privacy-note { font-size: 12px; color: var(--muted); margin-top: 20px; line-height: 1.5; }
+</style>
+</head>
+<body>
+<div class="login-card">
+  <div class="app-icon">
+    <svg width="32" height="32" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+      <path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 0 0-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0 0 20 4.77 5.07 5.07 0 0 0 19.91 1S18.73.65 16 2.48a13.38 13.38 0 0 0-7 0C6.27.65 5.09 1 5.09 1A5.07 5.07 0 0 0 5 4.77a5.44 5.44 0 0 0-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 0 0 9 18.13V22"/>
+    </svg>
+  </div>
+  <div class="app-name">Article to Audio</div>
+  <div class="app-tagline">Research PDFs → MP3 Audiobooks</div>
+  <div class="app-description">
+    Convert academic papers and research PDFs into natural-sounding audio using
+    Gemini AI for summarization and your choice of text-to-speech provider.
+  </div>
+  <a class="google-btn" href="/auth/login">
+    <svg width="18" height="18" viewBox="0 0 18 18" xmlns="http://www.w3.org/2000/svg">
+      <path d="M17.64 9.2c0-.637-.057-1.251-.164-1.84H9v3.481h4.844c-.209 1.125-.843 2.078-1.796 2.717v2.258h2.908c1.702-1.567 2.684-3.874 2.684-6.615z" fill="#4285F4"/>
+      <path d="M9 18c2.43 0 4.467-.806 5.956-2.184l-2.908-2.258c-.806.54-1.837.86-3.048.86-2.344 0-4.328-1.584-5.036-3.711H.957v2.332A8.997 8.997 0 0 0 9 18z" fill="#34A853"/>
+      <path d="M3.964 10.707A5.41 5.41 0 0 1 3.682 9c0-.593.102-1.17.282-1.707V4.961H.957A8.996 8.996 0 0 0 0 9c0 1.452.348 2.827.957 4.039l3.007-2.332z" fill="#FBBC05"/>
+      <path d="M9 3.58c1.321 0 2.508.454 3.44 1.345l2.582-2.58C13.463.891 11.426 0 9 0A8.997 8.997 0 0 0 .957 4.961L3.964 7.293C4.672 5.163 6.656 3.58 9 3.58z" fill="#EA4335"/>
+    </svg>
+    Sign in with Google
+  </a>
+  <p class="privacy-note">
+    Your API keys are stored securely in your personal account and are never shared.
+  </p>
+</div>
+</body>
+</html>
+"""
+
+MAIN_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Article to Audio</title>
+<style>
+""" + _CSS_VARS + """
   .topbar {
     background: var(--surface);
     border-bottom: 1px solid var(--border);
@@ -203,9 +456,10 @@ MAIN_HTML = """<!DOCTYPE html>
     top: 0;
     z-index: 10;
   }
-  .topbar h1 { font-size: 18px; font-weight: 700; letter-spacing: -0.3px; }
-  .topbar .tagline { font-size: 12px; color: var(--muted); margin-top: 1px; }
-  .topbar a {
+  .topbar-left h1 { font-size: 18px; font-weight: 700; letter-spacing: -0.3px; }
+  .topbar-left .tagline { font-size: 12px; color: var(--muted); margin-top: 1px; }
+  .topbar-right { display: flex; align-items: center; gap: 10px; }
+  .topbar-right a {
     color: var(--muted);
     text-decoration: none;
     font-size: 14px;
@@ -214,7 +468,23 @@ MAIN_HTML = """<!DOCTYPE html>
     border-radius: 8px;
     transition: color .2s, border-color .2s;
   }
-  .topbar a:hover { color: var(--text); border-color: var(--accent); }
+  .topbar-right a:hover { color: var(--text); border-color: var(--accent); }
+  .user-badge { display: flex; align-items: center; gap: 8px; }
+  .user-avatar {
+    width: 32px; height: 32px;
+    border-radius: 50%;
+    object-fit: cover;
+    border: 2px solid var(--border);
+  }
+  .user-avatar-fallback {
+    width: 32px; height: 32px;
+    border-radius: 50%;
+    background: var(--accent);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 13px; font-weight: 700; color: #fff;
+    flex-shrink: 0;
+  }
+  .user-name { font-size: 13px; color: var(--muted); max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .container { max-width: 600px; margin: 0 auto; padding: 24px 16px 80px; }
   .card {
     background: var(--surface);
@@ -241,18 +511,10 @@ MAIN_HTML = """<!DOCTYPE html>
   select { cursor: pointer; }
   .divider { text-align: center; color: var(--muted); font-size: 13px; margin: 12px 0; }
   .file-btn {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 8px;
-    width: 100%;
-    padding: 11px 14px;
-    background: var(--bg);
-    border: 1px dashed var(--border);
-    border-radius: 8px;
-    color: var(--muted);
-    font-size: 14px;
-    cursor: pointer;
+    display: flex; align-items: center; justify-content: center; gap: 8px;
+    width: 100%; padding: 11px 14px;
+    background: var(--bg); border: 1px dashed var(--border); border-radius: 8px;
+    color: var(--muted); font-size: 14px; cursor: pointer;
     transition: border-color .2s, color .2s;
   }
   .file-btn:hover { border-color: var(--accent); color: var(--text); }
@@ -261,77 +523,52 @@ MAIN_HTML = """<!DOCTYPE html>
   .options-row { display: flex; gap: 10px; }
   .options-row > div { flex: 1; }
   .btn {
-    display: block;
-    width: 100%;
-    padding: 14px;
-    background: var(--accent);
-    color: #fff;
-    font-size: 16px;
-    font-weight: 600;
-    border: none;
-    border-radius: 8px;
-    cursor: pointer;
-    transition: background .2s, opacity .2s;
-    margin-top: 4px;
+    display: block; width: 100%; padding: 14px;
+    background: var(--accent); color: #fff; font-size: 16px; font-weight: 600;
+    border: none; border-radius: 8px; cursor: pointer;
+    transition: background .2s, opacity .2s; margin-top: 4px;
   }
   .btn:hover { background: var(--accent-hover); }
   .btn:disabled { opacity: 0.5; cursor: not-allowed; }
   .btn-outline {
-    background: transparent;
-    border: 1px solid var(--border);
-    color: var(--muted);
-    font-size: 14px;
-    padding: 10px;
-    margin-top: 10px;
+    background: transparent; border: 1px solid var(--border);
+    color: var(--muted); font-size: 14px; padding: 10px; margin-top: 10px;
   }
   .btn-outline:hover { border-color: var(--error); color: var(--error); background: transparent; }
   .btn-success { background: var(--success); }
   .btn-success:hover { background: #3a9e6a; }
   .progress-wrap { margin: 14px 0 4px; }
-  .progress-bar-bg {
-    height: 6px;
-    background: var(--border);
-    border-radius: 99px;
-    overflow: hidden;
-  }
-  .progress-bar-fill {
-    height: 100%;
-    background: var(--accent);
-    border-radius: 99px;
-    transition: width .3s ease;
-    width: 0%;
-  }
-  .status-msg {
-    font-size: 13px;
-    color: var(--muted);
-    margin-top: 8px;
-    min-height: 18px;
-    word-break: break-word;
-  }
+  .progress-bar-bg { height: 6px; background: var(--border); border-radius: 99px; overflow: hidden; }
+  .progress-bar-fill { height: 100%; background: var(--accent); border-radius: 99px; transition: width .3s ease; width: 0%; }
+  .status-msg { font-size: 13px; color: var(--muted); margin-top: 8px; min-height: 18px; word-break: break-word; }
   .hidden { display: none !important; }
   .error-box {
-    background: rgba(224, 92, 92, 0.1);
-    border: 1px solid var(--error);
-    border-radius: 8px;
-    padding: 12px 14px;
-    font-size: 14px;
-    color: var(--error);
-    margin-top: 12px;
-    word-break: break-word;
+    background: rgba(224, 92, 92, 0.1); border: 1px solid var(--error);
+    border-radius: 8px; padding: 12px 14px; font-size: 14px; color: var(--error);
+    margin-top: 12px; word-break: break-word;
   }
   .note { font-size: 12px; color: var(--muted); margin-top: 8px; }
-  @media (max-width: 400px) {
-    .options-row { flex-direction: column; }
-  }
+  @media (max-width: 400px) { .options-row { flex-direction: column; } .user-name { display: none; } }
 </style>
 </head>
 <body>
 <div class="topbar">
-  <div>
-    <div class="topbar h1" style="font-size:18px;font-weight:700">Article to Audio</div>
+  <div class="topbar-left">
+    <h1>Article to Audio</h1>
     <div class="tagline">Convert research PDFs to MP3</div>
   </div>
-  <a href="/settings">Settings</a>
+  <div class="topbar-right">
+    <div class="user-badge">
+      {% if user_picture %}
+      <img class="user-avatar" src="{{ user_picture }}" alt="{{ user_name }}" referrerpolicy="no-referrer">
+      {% else %}
+      <div class="user-avatar-fallback">{{ user_name[0]|upper if user_name else '?' }}</div>
+      {% endif %}
+      <span class="user-name">{{ user_name }}</span>
+    </div>
+    <a href="/settings">Settings</a>
+    <a href="/auth/logout">Sign out</a>
+  </div>
 </div>
 
 <div class="container">
@@ -354,15 +591,15 @@ MAIN_HTML = """<!DOCTYPE html>
       <div>
         <label for="mode">Mode</label>
         <select id="mode">
-          <option value="Summarized">Summarized</option>
-          <option value="Verbatim">Verbatim</option>
+          <option value="Summarized" {% if default_mode == 'Summarized' %}selected{% endif %}>Summarized</option>
+          <option value="Verbatim" {% if default_mode == 'Verbatim' %}selected{% endif %}>Verbatim</option>
         </select>
       </div>
       <div>
         <label for="citations">Citations</label>
         <select id="citations">
-          <option value="Ignore">Ignore</option>
-          <option value="Subtle Mention">Subtle Mention</option>
+          <option value="Ignore" {% if default_citations == 'Ignore' %}selected{% endif %}>Ignore</option>
+          <option value="Subtle Mention" {% if default_citations == 'Subtle Mention' %}selected{% endif %}>Subtle Mention</option>
         </select>
       </div>
     </div>
@@ -428,10 +665,7 @@ urlInput.addEventListener('input', () => {
 convertBtn.addEventListener('click', async () => {
   const url = urlInput.value.trim();
   const file = fileInput.files[0];
-  if (!url && !file) {
-    alert('Please provide a PDF URL or choose a file.');
-    return;
-  }
+  if (!url && !file) { alert('Please provide a PDF URL or choose a file.'); return; }
 
   const mode = document.getElementById('mode').value;
   const citations = document.getElementById('citations').value;
@@ -565,30 +799,27 @@ SETTINGS_HTML = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Settings — Article to Audio</title>
 <style>
-  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-  :root {
-    --bg: #0f1117;
-    --surface: #1a1d27;
-    --border: #2a2d3a;
-    --accent: #5b8dee;
-    --text: #e8eaf0;
-    --muted: #8b8fa8;
-    --success: #4caf7d;
-    --error: #e05c5c;
-    --radius: 12px;
-  }
-  body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+""" + _CSS_VARS + """
   .topbar {
-    background: var(--surface);
-    border-bottom: 1px solid var(--border);
-    padding: 14px 20px;
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    position: sticky; top: 0; z-index: 10;
+    background: var(--surface); border-bottom: 1px solid var(--border);
+    padding: 14px 20px; display: flex; align-items: center;
+    gap: 12px; position: sticky; top: 0; z-index: 10;
   }
   .topbar a { color: var(--muted); text-decoration: none; font-size: 20px; line-height: 1; }
-  .topbar h1 { font-size: 18px; font-weight: 700; }
+  .topbar h1 { font-size: 18px; font-weight: 700; flex: 1; }
+  .topbar .user-info { display: flex; align-items: center; gap: 8px; }
+  .user-avatar { width: 32px; height: 32px; border-radius: 50%; object-fit: cover; border: 2px solid var(--border); }
+  .user-avatar-fallback {
+    width: 32px; height: 32px; border-radius: 50%; background: var(--accent);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 13px; font-weight: 700; color: #fff; flex-shrink: 0;
+  }
+  .topbar .logout-link {
+    color: var(--muted); text-decoration: none; font-size: 14px;
+    padding: 6px 12px; border: 1px solid var(--border); border-radius: 8px;
+    transition: color .2s, border-color .2s;
+  }
+  .topbar .logout-link:hover { color: var(--text); border-color: var(--accent); }
   .container { max-width: 600px; margin: 0 auto; padding: 24px 16px 80px; }
   .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px; margin-bottom: 16px; }
   .card-title { font-size: 13px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; margin-bottom: 14px; }
@@ -602,42 +833,74 @@ SETTINGS_HTML = """<!DOCTYPE html>
   }
   input:focus, select:focus { border-color: var(--accent); }
   .hint { font-size: 12px; color: var(--muted); margin-top: 5px; }
+  .hint a { color: var(--accent); }
   .btn {
     display: block; width: 100%; padding: 14px;
     background: var(--accent); color: #fff; font-size: 16px; font-weight: 600;
-    border: none; border-radius: 8px; cursor: pointer; transition: background .2s;
-    font-family: inherit;
+    border: none; border-radius: 8px; cursor: pointer; transition: background .2s; font-family: inherit;
   }
   .btn:hover { background: #4a7cd4; }
   .toast {
     position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
     background: var(--success); color: #fff; padding: 12px 20px;
     border-radius: 8px; font-size: 14px; font-weight: 600;
-    opacity: 0; transition: opacity .3s; pointer-events: none;
-    white-space: nowrap;
+    opacity: 0; transition: opacity .3s; pointer-events: none; white-space: nowrap;
   }
   .toast.show { opacity: 1; }
+  .account-info { display: flex; align-items: center; gap: 14px; padding: 4px 0; }
+  .account-avatar { width: 48px; height: 48px; border-radius: 50%; object-fit: cover; border: 2px solid var(--border); flex-shrink: 0; }
+  .account-avatar-fallback {
+    width: 48px; height: 48px; border-radius: 50%; background: var(--accent);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 18px; font-weight: 700; color: #fff; flex-shrink: 0;
+  }
+  .account-details { min-width: 0; }
+  .account-name { font-size: 16px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .account-email { font-size: 13px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 </style>
 </head>
 <body>
 <div class="topbar">
   <a href="/" title="Back">&#8592;</a>
   <h1>Settings</h1>
+  <div class="user-info">
+    {% if user_picture %}
+    <img class="user-avatar" src="{{ user_picture }}" alt="{{ user_name }}" referrerpolicy="no-referrer">
+    {% else %}
+    <div class="user-avatar-fallback">{{ user_name[0]|upper if user_name else '?' }}</div>
+    {% endif %}
+  </div>
+  <a class="logout-link" href="/auth/logout">Sign out</a>
 </div>
 
 <div class="container">
+  <div class="card">
+    <div class="card-title">Account</div>
+    <div class="account-info">
+      {% if user_picture %}
+      <img class="account-avatar" src="{{ user_picture }}" alt="{{ user_name }}" referrerpolicy="no-referrer">
+      {% else %}
+      <div class="account-avatar-fallback">{{ user_name[0]|upper if user_name else '?' }}</div>
+      {% endif %}
+      <div class="account-details">
+        <div class="account-name">{{ user_name }}</div>
+        <div class="account-email">{{ user_email }}</div>
+      </div>
+    </div>
+  </div>
+
   <form id="settings-form">
     <div class="card">
       <div class="card-title">API Keys</div>
       <div class="field">
         <label for="gemini_api_key">Gemini API Key <span style="color:var(--error)">*</span></label>
         <input type="password" id="gemini_api_key" name="gemini_api_key" placeholder="AIza..." value="{{ config.gemini_api_key }}" autocomplete="off" />
-        <p class="hint">Required for text processing and Gemini TTS. Get one at <a href="https://aistudio.google.com/app/apikey" target="_blank" style="color:var(--accent)">aistudio.google.com</a></p>
+        <p class="hint">Required for text processing and Gemini TTS. Get one at <a href="https://aistudio.google.com/app/apikey" target="_blank">aistudio.google.com</a></p>
       </div>
       <div class="field">
         <label for="inworld_api_key">Inworld API Key <span style="color:var(--muted)">(optional)</span></label>
         <input type="password" id="inworld_api_key" name="inworld_api_key" placeholder="Base64-encoded credentials" value="{{ config.inworld_api_key }}" autocomplete="off" />
-        <p class="hint">Optional. If not set, Gemini TTS is used.</p>
+        <p class="hint">Optional. If not set, Gemini TTS is used automatically.</p>
       </div>
     </div>
 
@@ -718,7 +981,11 @@ document.getElementById('settings-form').addEventListener('submit', async e => {
   const data = {};
   new FormData(form).forEach((v, k) => { data[k] = v; });
 
-  const resp = await fetch('/settings', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(data) });
+  const resp = await fetch('/settings', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  });
   if (resp.ok) {
     const toast = document.getElementById('toast');
     toast.classList.add('show');
@@ -741,50 +1008,101 @@ TEXT_MODELS = [
     "gemini-1.5-pro",
 ]
 
+# ---------------------------------------------------------------------------
+# Routes — Auth
+# ---------------------------------------------------------------------------
+
+@app.route("/auth/login")
+def auth_login():
+    redirect_uri = os.environ.get(
+        "GOOGLE_REDIRECT_URI",
+        url_for("auth_callback", _external=True),
+    )
+    return google.authorize_redirect(redirect_uri)
+
+
+@app.route("/auth/callback")
+def auth_callback():
+    token = google.authorize_access_token()
+    user_info = token.get("userinfo")
+    if not user_info:
+        user_info = google.userinfo()
+
+    google_id = user_info["sub"]
+    email = user_info.get("email", "")
+    name = user_info.get("name", "")
+    picture = user_info.get("picture", "")
+
+    upsert_user(google_id, email, name, picture)
+
+    session["user_id"] = google_id
+    session["user_email"] = email
+    session["user_name"] = name
+    session["user_picture"] = picture
+
+    return redirect("/")
+
+
+@app.route("/auth/logout")
+def auth_logout():
+    session.clear()
+    return redirect("/")
+
+
+# ---------------------------------------------------------------------------
+# Routes — App
+# ---------------------------------------------------------------------------
 
 @app.route("/")
+@require_login
 def index():
-    return render_template_string(MAIN_HTML)
+    user = get_user(session["user_id"])
+    return render_template_string(
+        MAIN_HTML,
+        user_name=session.get("user_name", ""),
+        user_picture=session.get("user_picture", ""),
+        default_mode=user.get("conversion_mode", "Summarized") if user else "Summarized",
+        default_citations=user.get("citation_style", "Ignore") if user else "Ignore",
+    )
 
 
 @app.route("/settings", methods=["GET"])
+@require_login
 def settings_get():
-    mgr = ConfigManager(CONFIG_PATH)
-    mgr.ensure_config()
-    cfg = mgr.load()
-    # Mask keys for display: show empty string, not the actual key
-    display_cfg = dict(cfg)
-    # We keep actual values so the password fields pre-fill (browser masks them)
+    user = get_user(session["user_id"])
+    cfg = user or {}
     gemini_voices = ConfigManager.get_available_voices("gemini")
     inworld_voices = ConfigManager.get_available_voices("inworld")
     return render_template_string(
         SETTINGS_HTML,
-        config=display_cfg,
+        config=cfg,
         text_models=TEXT_MODELS,
         gemini_voices=gemini_voices,
         inworld_voices=inworld_voices,
+        user_name=session.get("user_name", ""),
+        user_email=session.get("user_email", ""),
+        user_picture=session.get("user_picture", ""),
     )
 
 
 @app.route("/settings", methods=["POST"])
+@require_login
 def settings_post():
     data = request.get_json(force=True)
-    allowed = {
-        "gemini_api_key", "inworld_api_key", "model_name",
-        "tts_provider", "tts_voice_name", "inworld_voice_id",
-        "conversion_mode", "citation_style",
-    }
-    updates = {k: v for k, v in data.items() if k in allowed}
-    mgr = ConfigManager(CONFIG_PATH)
-    mgr.ensure_config()
-    mgr.save(updates)
+    update_user_settings(session["user_id"], data)
     return jsonify({"ok": True})
 
 
 @app.route("/convert", methods=["POST"])
+@require_login
 def convert():
-    mode = request.form.get("mode", "Summarized")
-    citations = request.form.get("citations", "Ignore")
+    user_id = session["user_id"]
+    user = get_user(user_id)
+    if not user:
+        return jsonify({"error": "User not found. Please log in again."}), 401
+
+    mode = request.form.get("mode", user.get("conversion_mode", "Summarized"))
+    citations = request.form.get("citations", user.get("citation_style", "Ignore"))
 
     pdf_url = request.form.get("pdf_url", "").strip()
     pdf_file = request.files.get("pdf_file")
@@ -799,7 +1117,6 @@ def convert():
         pdf_path = tmp.name
         cleanup = True
     else:
-        # Download the PDF from URL
         filename = pdf_url.split("/")[-1].split("?")[0] or "article.pdf"
         if not filename.lower().endswith(".pdf"):
             filename += ".pdf"
@@ -815,13 +1132,13 @@ def convert():
         except Exception as e:
             return jsonify({"error": f"Failed to download PDF: {e}"}), 400
 
-    job = Job(filename)
+    job = Job(filename, user_id)
     with _jobs_lock:
         _jobs[job.id] = job
 
     thread = threading.Thread(
         target=run_conversion,
-        args=(job, pdf_path, mode, citations, cleanup),
+        args=(job, pdf_path, mode, citations, cleanup, dict(user)),
         daemon=True,
     )
     thread.start()
@@ -830,23 +1147,25 @@ def convert():
 
 
 @app.route("/cancel/<job_id>", methods=["POST"])
+@require_login
 def cancel_job(job_id):
     with _jobs_lock:
         job = _jobs.get(job_id)
-    if job:
+    if job and job.user_id == session["user_id"]:
         job.cancel_event.set()
     return jsonify({"ok": True})
 
 
 @app.route("/stream/<job_id>")
+@require_login
 def stream(job_id):
     with _jobs_lock:
         job = _jobs.get(job_id)
-    if not job:
+    if not job or job.user_id != session["user_id"]:
         return Response("data: Job not found\n\n", mimetype="text/event-stream")
 
     def generate():
-        ping_interval = 15  # seconds
+        ping_interval = 15
         last_ping = time.time()
         while True:
             try:
@@ -862,29 +1181,43 @@ def stream(job_id):
                 if job.done:
                     break
 
-    return Response(generate(), mimetype="text/event-stream",
-                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+    return Response(
+        generate(),
+        mimetype="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.route("/download/<job_id>")
+@require_login
 def download(job_id):
     with _jobs_lock:
         job = _jobs.get(job_id)
-    if not job or not job.output_path or not os.path.exists(job.output_path):
+    if not job or job.user_id != session["user_id"]:
+        return "File not found", 404
+    if not job.output_path or not os.path.exists(job.output_path):
         return "File not found", 404
 
     stem = Path(job.filename).stem[:60]
     download_name = f"{stem}.mp3"
-    return send_file(job.output_path, as_attachment=True, download_name=download_name,
-                     mimetype="audio/mpeg")
+    return send_file(
+        job.output_path,
+        as_attachment=True,
+        download_name=download_name,
+        mimetype="audio/mpeg",
+    )
 
+
+@app.route("/health")
+def health():
+    return jsonify({"ok": True})
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=5000)
-    parser.add_argument("--debug", action="store_true")
-    args = parser.parse_args()
-    print(f"Starting Article to Audio web app on http://{args.host}:{args.port}")
-    app.run(host=args.host, port=args.port, debug=args.debug, threaded=True)
+    port = int(os.environ.get("PORT", 5000))
+    print(f"Starting Article to Audio web app on http://0.0.0.0:{port}")
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
