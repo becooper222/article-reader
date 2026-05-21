@@ -177,6 +177,7 @@ cython_debug/
 .DS_Store
 
 # Project-specific
+users.db
 config.json
 .env.local
 .env
